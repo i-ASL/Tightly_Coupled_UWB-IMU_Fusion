@@ -1,4 +1,4 @@
-# Experimental Comparison of Tightly and Loosely Coupled Kalman Filters for 6D Pose Estimation Using UWB and IMU Sensors(2024ICCAS)
+# Experimental Comparison of Tightly and Loosely Coupled Kalman Filters for 6D Pose Estimation Using UWB and IMU Sensors(2024 ICCAS)
 
 we present a novel approach for robot pose estimation in SE(3) using a tightly coupled integration
 of Ultra-Wideband (UWB) and Inertial Measurement Unit (IMU) data. Our method leverages Extended Kalman
