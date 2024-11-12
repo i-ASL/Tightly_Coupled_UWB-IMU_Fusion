@@ -3,184 +3,190 @@
  * Date: 2024-11-5
  * brief: 6D pose estimation using tightly coupled UWB/IMU fusion using filtering method(EKF/ESKF/UKF/LIEKF)
  */
-#include "tightlyCoupledFusionESKF.h" 
-#include <Eigen/Dense>
-#include <Eigen/Geometry>
+#include "tightlyCoupledFusionESKF.h"
+#include <ros/ros.h>
+#include <iostream>
+#include <sensor_msgs/Imu.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <vector>
+#include <queue>
+#include <nlink_parser/LinktrackTagframe0.h>
 
+using namespace std;
 
-TightlyCoupled::TightlyCoupled()
+double dt = 0;
+double beforeT = 0;
+TightlyCoupled tightlyFuser;
+StateforESKF<double> STATE;
+queue<UwbData<double>> uwbDataQueue;
+queue<ImuData<double>> imuDataQueue;
+bool uwbInit = false;
+bool imuInit = false;
+bool initialize = false;
+double uwbInitTime = 0;
+double imuInitTime = 0;
+Eigen::Vector3d linearAcc;
+Eigen::Vector3d angularVel;
+ros::Publisher resultPuber;
+
+void clearQueue(queue<ImuData<double>> &q)
 {
-    covP.setZero();
-    covQ.setIdentity()*0.001;
-    covR.setIdentity()*0.08;
-    vecZ.setZero();
-    vecH.setZero();
-    XdX.setZero();
-    jacobianMatF.setIdentity();
-    jacobianMatH.setZero();
-    anchorPositions.setZero();
-    _g << 0, 0, 9.81;
-
-    TOL =1e-9;
-    dt = 0;
-    STATE.p <<0, 0, 0;
-    STATE.q = Eigen::Quaterniond::Identity();
-
-    STATE.v.setZero();
-    STATE.a_b.setZero();
-    STATE.w_b.setZero();
-    updateH();
-}
-
-TightlyCoupled::~TightlyCoupled() {}
-
-void TightlyCoupled::setDt(const double delta_t){
-    dt = delta_t;
-}
-
-void TightlyCoupled::setZ(const UwbData<double> currUwbData){
-    for(int i=0; i<8; i++){
-        vecZ(i) = currUwbData.distance(i);
+    while (!q.empty()) {
+        q.pop();
     }
-
-}
-void TightlyCoupled::setImuVar(const double stdV, const double stdW){
-    covQ.block<3,3>(9,9) = stdV*Eigen::Matrix3d::Identity();
-    covQ.block<3,3>(12,12) = stdW*Eigen::Matrix3d::Identity();
 }
 
-void TightlyCoupled::setAnchorPositions(const Eigen::Matrix<double, 3, 8> &anchorpositions){
-    anchorPositions = anchorpositions;
-    std::cout <<"Anchor positions: \n"<<anchorPositions<<std::endl;
+void clearQueue(queue<UwbData<double>> &q)
+{
+    while (!q.empty()) {
+        q.pop();
+    }
 }
 
-Eigen::Matrix3d TightlyCoupled::vectorToSkewSymmetric(const Eigen::Vector3d &vector){
-    Eigen::Matrix3d Rot;
-    Rot << 0, -vector.z(), vector.y(),
-          vector.z(), 0, -vector.x(),
-          -vector.y(), vector.x(), 0;
+void publisher()
+{
+    geometry_msgs::PoseStamped pose;
+    pose.header.frame_id = "eskf";
+    pose.header.stamp = ros::Time::now();
+    STATE = tightlyFuser.getState();
+
+    pose.pose.position.x = STATE.p(0);
+    pose.pose.position.y = STATE.p(1);
+    pose.pose.position.z = STATE.p(2);
+    Eigen::Quaterniond quaternion = STATE.q;
+    pose.pose.orientation.x = quaternion.x();
+    pose.pose.orientation.y = quaternion.y();
+    pose.pose.orientation.z = quaternion.z();
+    pose.pose.orientation.w = quaternion.w();
+
+    resultPuber.publish(pose);
+}
+
+void processData()
+{   
+    if (imuDataQueue.size() > 1 && !uwbDataQueue.empty()) {
+        while (!uwbDataQueue.empty() &&
+               (uwbDataQueue.front().timestamp < imuDataQueue.front().timestamp || 
+                uwbDataQueue.front().timestamp > imuDataQueue.back().timestamp)) {
+            uwbDataQueue.pop();  
+        }
+        ImuData<double> imuData1 = imuDataQueue.front();
+        ImuData<double> imuData2 = imuDataQueue.back();
+        UwbData<double> uwbData = uwbDataQueue.front();
+        if (imuData1.timestamp <= uwbData.timestamp && uwbData.timestamp <= imuData2.timestamp) {
+            double t1 = imuData1.timestamp;
+            double t2 = imuData2.timestamp;
+            double t = uwbData.timestamp;
+            double alpha;
+            double delta_t = t2 - t1;
+            if (delta_t == 0) {
+                ROS_WARN("IMU timestamps t1 and t2 are equal. Setting alpha to 0.");
+                alpha = 0;
+            } else {
+                alpha = (t - t1) / delta_t;
+            }
+
+            imuData1.acc = (1 - alpha) * imuData1.acc + alpha * imuData2.acc;
+            imuData1.gyr = (1 - alpha) * imuData1.gyr + alpha * imuData2.gyr;
+
+            dt = t - beforeT;
+            beforeT = t;
+
+            tightlyFuser.setDt(dt);
+            tightlyFuser.setZ(uwbData);
+            tightlyFuser.prediction(imuData1);
+            tightlyFuser.correction();
+
+            uwbDataQueue.pop();
+            imuDataQueue.pop();
+            
+
+            publisher();
+        }
+    }
+}
+
+void imuCallback(const sensor_msgs::ImuConstPtr &msg)
+{   
+    ImuData<double> imuData;
+    if (!imuInit){
+        imuInitTime = msg->header.stamp.toSec();
+        imuInit = true;
+    }
+    imuData.timestamp = msg->header.stamp.toSec()-imuInitTime;  
+    imuData.gyr[0] = msg->angular_velocity.x;
+    imuData.gyr[1] = msg->angular_velocity.y;
+    imuData.gyr[2] = msg->angular_velocity.z;
+    imuData.acc[0] = msg->linear_acceleration.x;
+    imuData.acc[1] = msg->linear_acceleration.y;
+    imuData.acc[2] = msg->linear_acceleration.z;
+
+    imuDataQueue.push(imuData);
+    processData();
     
-    return Rot;
 }
 
-Eigen::Matrix3d TightlyCoupled::Exp(const Eigen::Vector3d &omega){
-    double angle = omega.norm();
-    Eigen::Matrix3d Rot;
+void uwbCallback(const nlink_parser::LinktrackTagframe0 &msg)
+{   
+    UwbData<double> uwbData;
+    if(!uwbInit){
+        uwbInitTime = msg.system_time/1000.00;
+        uwbInit = true;
+    }
+    uwbData.timestamp = msg.system_time/1000.00  - uwbInitTime;  
+    for (int i = 0; i < 8; i++) {
+        uwbData.distance[i] = msg.dis_arr[i];
+    }
+    uwbDataQueue.push(uwbData);
+    processData();
+}
+
+int main(int argc, char **argv)
+{
+    ros::init(argc, argv, "tightly_coupled_eskf_fusion");
+    ros::NodeHandle nh, ph("~");
     
-    if (angle<TOL){
-        Rot = Eigen::Matrix3d::Identity();
+    double stdV, stdW;
+    std::vector<double> anchorpositions_vec;
+    if (!initialize){
+        
+        if (!ph.getParam("/tightly_coupled_eskf/stdV", stdV)) {
+            ROS_ERROR("Failed to get parameter stdV");
+            return -1;
+        }
+
+        if (!ph.getParam("/tightly_coupled_eskf/stdW", stdW)) {
+            ROS_ERROR("Failed to get parameter stdW");
+            return -1;
+        }
+
+        if (!ph.getParam("/tightly_coupled_eskf/anchorPositions", anchorpositions_vec)) {
+            ROS_ERROR("Failed to get parameter anchorPositions");
+            return -1;
+        }
+
+        if (anchorpositions_vec.size() == 24) {  
+            Eigen::Matrix<double, 3, 8> anchorpositions;
+            for (int i = 0; i < 8; i++) {
+                anchorpositions(0, i) = anchorpositions_vec[i];
+                anchorpositions(1, i) = anchorpositions_vec[i + 8];
+                anchorpositions(2, i) = anchorpositions_vec[i + 16];
+            }
+            tightlyFuser.setAnchorPositions(anchorpositions);
+        } else {
+            ROS_ERROR("anchorPositions parameter size is incorrect");
+            return -1;
+        }
+        initialize = true;
+        tightlyFuser.setImuVar(stdV, stdW);
     }
-    else{
-        Eigen::Vector3d axis = omega/angle;
-        double c = cos(angle);
-        double s = sin(angle);
 
-        Rot = c*Eigen::Matrix3d::Identity() + (1 - c)*axis*axis.transpose() + s*vectorToSkewSymmetric(axis);
-    }
-    return Rot;
+    resultPuber = nh.advertise<geometry_msgs::PoseStamped>("/eskf", 1);
+    ros::Subscriber uwbSub = nh.subscribe("/nlink_linktrack_tagframe0", 10, uwbCallback);
+    ros::Subscriber imuSub = nh.subscribe("/imu/data", 10, imuCallback);
+    STATE = tightlyFuser.getState();
+    tightlyFuser.setState(STATE);
+    ros::spin();  
 
-}
-
-Eigen::Quaterniond TightlyCoupled::getQuaFromAA(Eigen::Matrix<double, 3, 1> vec){
-    double theta = sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
-    if (0 == theta)
-        return Eigen::Quaterniond::Identity();
-    Eigen::Matrix<double, 3, 1> unitAxis = vec / theta;
-    double w = cos(0.5 * theta);
-    double sinT = sin(0.5 * theta);
-    double x = unitAxis[0] * sinT;
-    double y = unitAxis[1] * sinT;
-    double z = unitAxis[2] * sinT;
-    Eigen::Quaterniond qua(w, x, y, z);
-    qua.normalized();
-
-    return qua;
-}
-
-void TightlyCoupled::motionModelJacobian(const ImuData<double> &imu_data){
-    Eigen::Matrix3d Rot = STATE.q.toRotationMatrix();
-    jacobianMatF.block<3, 3>(0,6) = dt * Eigen::Matrix3d::Identity();
-    jacobianMatF.block<3, 3>(6,9) = -Rot*dt;
-    jacobianMatF.block<3, 3>(3,3) = Rot.transpose() * Exp((imu_data.gyr - STATE.w_b)*dt);
-    jacobianMatF.block<3, 3>(3,12) = -dt * Eigen::Matrix3d::Identity();
-    jacobianMatF.block<3, 3>(6,3) = -Rot*vectorToSkewSymmetric(imu_data.acc-STATE.a_b)*dt;
-}
-
-void TightlyCoupled::motionModel(const ImuData<double> &imu_data){
-    Eigen::Matrix3d Rot = STATE.q.toRotationMatrix();
-    Eigen::Vector3d accWorld = Rot*(imu_data.acc - STATE.a_b) + _g;
-    STATE.p += STATE.v*dt+0.5*accWorld*dt*dt;
-    STATE.v += accWorld*dt;
-    Eigen::Quaterniond deltaQ = getQuaFromAA((imu_data.gyr - STATE.w_b)*dt);
-    STATE.q = STATE.q * deltaQ;
-}
-
-void TightlyCoupled::prediction(const ImuData<double> &imu_data){
-    motionModelJacobian(imu_data);
-    motionModel(imu_data);
-    covP = jacobianMatF*covP*jacobianMatF.transpose() + covQ;
-}
-
-void TightlyCoupled::updateH(){
-    Eigen::Quaterniond quat = STATE.q;
-    XdX.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
-    XdX.block<3,3>(7,6) = Eigen::Matrix3d::Identity();
-    XdX.block<3,3>(10,9) = Eigen::Matrix3d::Identity();
-    XdX.block<3,3>(13,12) = Eigen::Matrix3d::Identity();
-    XdX.block<4,3>(3,3) = 0.5 * (Eigen::Matrix<double,4,3>() << 
-                        -quat.x(), -quat.y(), -quat.z(),
-                        quat.w(), -quat.z(),  quat.y(),
-                        quat.z(),  quat.w(), -quat.x(),
-                        -quat.y(),  quat.x(),  quat.w()).finished();                        
-
-}
-
-void TightlyCoupled::measurementModel(){
-    Eigen::Vector3d p = STATE.p;
-    for (int i=0; i<vecH.size(); i++){
-        vecH(i) = (p - anchorPositions.col(i)).norm();
-    }
-}
-
-void TightlyCoupled::measurementModelJacobian(){
-    Eigen::Vector3d p = STATE.p;
-    Eigen::Matrix<double, 8, 16> H;
-    for (int i=0; i<jacobianMatH.rows(); i++){
-        H(i,0) = (p(0)-anchorPositions(0,i))/vecH(i);
-        H(i,1) = (p(1)-anchorPositions(1,i))/vecH(i);
-        H(i,2) = (p(2)-anchorPositions(2,i))/vecH(i); 
-    }
-    updateH();
-    jacobianMatH = H*XdX;
-}
-
-StateforESKF<double> TightlyCoupled::correction(){
-    measurementModel();
-    measurementModelJacobian();
-    Eigen::Matrix<double, 8, 8> residualCov;
-    Eigen::Matrix<double, 15, 8> K;
-    Eigen::Matrix<double, 15, 1> updateState;
-    residualCov = jacobianMatH*covP*jacobianMatH.transpose() + covR;
-    if (residualCov.determinant() == 0 || !residualCov.allFinite()) {
-        std::cerr << "residualCov is singular or contains NaN/Inf" << std::endl;
-        return STATE;
-    }
-    K = covP*jacobianMatH.transpose()*residualCov.inverse();
-    updateState = K*(vecZ-vecH);
-    STATE.p += updateState.segment<3>(0);
-    Eigen::Quaterniond deltaQ = getQuaFromAA(updateState.segment<3>(3));
-    STATE.q = STATE.q*deltaQ;
-    STATE.v += updateState.segment<3>(6);
-    STATE.a_b += updateState.segment<3>(9);
-    STATE.w_b += updateState.segment<3>(12);
-    Eigen::Matrix<double, 15, 15> IKH = (Eigen::Matrix<double, 15, 15>::Identity()-(K*jacobianMatH));
-    covP = IKH*covP*IKH.transpose() + K*covR*K.transpose();
-
-    return STATE;
-}
-void TightlyCoupled::setState(StateforESKF<double> &State){
-    STATE = State;
-}
-StateforESKF<double> TightlyCoupled::getState(){
-    return STATE;
+    return 0;
 }
