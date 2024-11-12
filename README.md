@@ -62,7 +62,7 @@ Experimental results
 | **ESKF**  | 0.1573 | 0.1212 | 0.1480 |
 | **LIEKF** | 0.1567 | 0.1204 | 0.1513 |
 | **UKF**   | 0.2446 | 0.2083 | 0.1285 |
----
+
 ### Orientation RMSE (degree)
 
 | Filter | Roll RMSE | Pitch RMSE | Yaw RMSE |
